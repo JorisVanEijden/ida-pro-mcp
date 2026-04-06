@@ -1159,3 +1159,80 @@ def infer_types(
             )
 
     return results
+
+
+# ============================================================================
+# Type Export
+# ============================================================================
+
+
+class ExportTypesResult(TypedDict, total=False):
+    format: str
+    content: str
+    type_count: int
+    path: str
+    error: str
+
+
+@tool
+@idasync
+def export_types(
+    path: Annotated[str | None, "File path to write the header to (optional)"] = None,
+    filter: Annotated[
+        str | None,
+        "Case-insensitive substring filter on type names (optional, exports all if omitted)",
+    ] = None,
+) -> ExportTypesResult:
+    """Export local types as a C header file, identical to IDA's Edit > Export Local Types menu.
+
+    Returns the header content and optionally writes it to a file.
+    Use the filter parameter to export only types whose names contain a substring.
+    """
+    limit = compat.get_ordinal_limit()
+
+    if filter:
+        # Collect ordinals matching the filter
+        ordinals = []
+        for ordinal in range(1, limit):
+            tif = ida_typeinf.tinfo_t()
+            if tif.get_numbered_type(None, ordinal):
+                name = tif.get_type_name()
+                if name and filter.lower() in name.lower():
+                    ordinals.append(ordinal)
+    else:
+        ordinals = list(range(1, limit))
+
+    if not ordinals:
+        return {
+            "format": "c_header",
+            "content": "",
+            "type_count": 0,
+            "error": "No types found" + (f" matching '{filter}'" if filter else ""),
+        }
+
+    ordinals_str = ",".join(str(o) for o in ordinals)
+    header = idc.print_decls(ordinals_str, idc.PDF_DEF_BASE | idc.PDF_INCL_DEPS)
+
+    if not header:
+        return {
+            "format": "c_header",
+            "content": "",
+            "type_count": 0,
+            "error": "print_decls returned empty output",
+        }
+
+    result: ExportTypesResult = {
+        "format": "c_header",
+        "content": header,
+        "type_count": len(ordinals),
+    }
+
+    if path:
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(header)
+            result["path"] = path
+        except Exception as e:
+            result["error"] = f"Written to memory but failed to write file: {e}"
+
+    return result
