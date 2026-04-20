@@ -127,7 +127,10 @@ class MCPUIHooks(ida_kernwin.UI_Hooks):
         ida_kernwin.attach_action_to_menu(
             "Edit/Plugins/", CONFIG_ACTION_ID, idaapi.SETMENU_APP
         )
-        if self.plugin.autostart:
+        # Skip autostart when running under idalib – the idalib_server manages
+        # the MCP server lifecycle itself and would otherwise hit a port conflict
+        # because unload_package creates a separate MCP_SERVER instance.
+        if self.plugin.autostart and ida_kernwin.is_idaq():
             print("[MCP] Autostarting server...")
             self.plugin.run(0)
         self.unhook()
@@ -153,8 +156,10 @@ class MCP(idaapi.plugin_t):
         self.port = self.DEFAULT_PORT
         self.autostart = _get_autostart()
 
-        if self.autostart:
+        if self.autostart and ida_kernwin.is_idaq():
             print("[MCP] Plugin loaded, server will start automatically")
+        elif not ida_kernwin.is_idaq():
+            print("[MCP] Plugin loaded (idalib mode, server managed externally)")
         else:
             print(
                 f"[MCP] Plugin loaded, use Edit -> Plugins -> MCP ({hotkey}) to start the server"
@@ -196,14 +201,9 @@ class MCP(idaapi.plugin_t):
         # HACK: ensure fresh load of ida_mcp package
         unload_package("ida_mcp")
         if TYPE_CHECKING:
-            from .ida_mcp import MCP_SERVER, IdaMcpHttpRequestHandler, init_caches, set_local_instance
+            from .ida_mcp import MCP_SERVER, IdaMcpHttpRequestHandler, set_local_instance
         else:
-            from ida_mcp import MCP_SERVER, IdaMcpHttpRequestHandler, init_caches, set_local_instance
-
-        try:
-            init_caches()
-        except Exception as e:
-            print(f"[MCP] Cache init failed: {e}")
+            from ida_mcp import MCP_SERVER, IdaMcpHttpRequestHandler, set_local_instance
 
         port = self.port
         max_port = port + 100

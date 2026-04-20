@@ -25,6 +25,7 @@ from .utils import (
     pattern_filter,
     get_stack_frame_variables_internal,
     decompile_function_safe,
+    compact_whitespace,
     get_assembly_lines,
     get_all_xrefs,
     get_all_comments,
@@ -35,6 +36,7 @@ from .utils import (
     extract_function_constants,
     Argument,
     DisassemblyFunction,
+    Ref,
     Xref,
     BasicBlock,
     StructFieldQuery,
@@ -49,6 +51,7 @@ from . import compat
 class DecompileResult(TypedDict):
     addr: str
     code: str | None
+    refs: NotRequired[list[Ref]]
     error: NotRequired[str]
 
 
@@ -90,7 +93,7 @@ class FuncProfileItem(TypedDict, total=False):
 
 
 class FuncProfileResult(TypedDict, total=False):
-    query: str
+    target: str
     data: list[FuncProfileItem]
     next_offset: int | None
     error: str | None
@@ -140,7 +143,7 @@ class AnalyzeBatchDetails(TypedDict, total=False):
 
 
 class AnalyzeBatchResult(TypedDict, total=False):
-    query: str
+    target: str
     addr: str | None
     name: str | None
     analysis: AnalyzeBatchDetails | None
@@ -169,7 +172,7 @@ XrefQueryRow = TypedDict(
 
 
 class XrefQueryResult(TypedDict, total=False):
-    query: str
+    target: str
     resolved_addr: str | None
     direction: str
     xref_type: str
@@ -493,6 +496,108 @@ def _resolve_function_start(query: object) -> tuple[int | None, str | None]:
     return func.start_ea, None
 
 
+def _collect_line_comments(ea: int) -> list[str]:
+    out: list[str] = []
+    i = 0
+    while True:
+        line = ida_lines.get_extra_cmt(ea, ida_lines.E_PREV + i)
+        if line is None:
+            break
+        out.append(ida_lines.tag_remove(line))
+        i += 1
+    cmt = ida_bytes.get_cmt(ea, False)
+    if cmt:
+        out.append(cmt)
+    rcmt = ida_bytes.get_cmt(ea, True)
+    if rcmt and rcmt != cmt:
+        out.append(rcmt)
+    i = 0
+    while True:
+        line = ida_lines.get_extra_cmt(ea, ida_lines.E_NEXT + i)
+        if line is None:
+            break
+        out.append(ida_lines.tag_remove(line))
+        i += 1
+    return out
+
+
+def _resolve_ref_name(ea: int) -> str:
+    name = ida_name.get_ea_name(ea)
+    if name:
+        return name
+    func = idaapi.get_func(ea)
+    if func and func.start_ea == ea:
+        return ida_funcs.get_func_name(ea) or ""
+    return ""
+
+
+_STR_CODECS = {0: "utf-8", 1: "utf-16-le", 2: "utf-32-le"}
+
+
+def _resolve_ref(ea: int) -> dict | None:
+    name = _resolve_ref_name(ea)
+    if not name:
+        return None
+    info: dict = {"addr": hex(ea), "name": name}
+    flags = ida_bytes.get_flags(ea)
+    if ida_bytes.is_strlit(flags):
+        strtype = ida_nalt.get_str_type(ea)
+        if strtype is None or strtype < 0:
+            strtype = ida_nalt.STRTYPE_C
+        raw = ida_bytes.get_strlit_contents(ea, -1, strtype)
+        if raw:
+            codec = _STR_CODECS.get(strtype & 3, "utf-8")
+            try:
+                info["string"] = raw.decode(codec, errors="replace")
+            except Exception:
+                pass
+    return info
+
+
+def _collect_decompile_refs(cfunc) -> list[dict]:
+    import ida_hexrays
+
+    seen: set[int] = set()
+    refs: list[dict] = []
+
+    class _Visitor(ida_hexrays.ctree_visitor_t):
+        def __init__(self):
+            ida_hexrays.ctree_visitor_t.__init__(self, ida_hexrays.CV_FAST)
+
+        def visit_expr(self, e):
+            if e.op == ida_hexrays.cot_obj:
+                ea = e.obj_ea
+                if ea != idaapi.BADADDR and ea not in seen:
+                    seen.add(ea)
+                    info = _resolve_ref(ea)
+                    if info:
+                        refs.append(info)
+            return 0
+
+    _Visitor().apply_to(cfunc.body, None)
+    return refs
+
+
+def _collect_line_refs(ea: int) -> list[dict]:
+    seen: set[int] = set()
+    refs: list[dict] = []
+    for ref_ea in idautils.CodeRefsFrom(ea, False):
+        if ref_ea == idaapi.BADADDR or ref_ea in seen:
+            continue
+        seen.add(ref_ea)
+        info = _resolve_ref(ref_ea)
+        if info:
+            refs.append(info)
+    for ref_ea in idautils.DataRefsFrom(ea):
+        if ref_ea == idaapi.BADADDR or ref_ea in seen:
+            continue
+        seen.add(ref_ea)
+        info = _resolve_ref(ref_ea)
+        if info:
+            refs.append(info)
+    return refs
+
+
 def _limit_items(items: list, limit: int) -> tuple[list, bool]:
     if limit < 0:
         limit = 0
@@ -510,7 +615,7 @@ def _disasm_lines_limited(func: ida_funcs.func_t, max_insns: int) -> tuple[list[
             break
         line = ida_lines.generate_disasm_line(item_ea, 0)
         instruction = ida_lines.tag_remove(line) if line else ""
-        lines.append(f"{item_ea:x}  {instruction}")
+        lines.append(f"{item_ea:x}  {compact_whitespace(instruction)}")
     return lines, truncated
 
 
@@ -643,24 +748,29 @@ def _profile_function(
 @tool_timeout(90.0)
 def decompile(
     addr: Annotated[str, "Function address or name to decompile"],
+    include_addresses: Annotated[
+        bool, "Append /*0xNNNN*/ markers per line (default: true). Set false to save tokens."
+    ] = True,
 ) -> DecompileResult:
     """Decompile function(s) at address(es); returns pseudocode and per-item errors."""
     try:
-        try:
-            start = parse_address(addr)
-        except IDAError:
-            ea = idaapi.get_name_ea(idaapi.BADADDR, addr)
-            if ea == idaapi.BADADDR:
-                return {
-                    "addr": addr,
-                    "code": None,
-                    "error": f"Function not found: {addr!r}",
-                }
-            start = ea
-        code = decompile_function_safe(start)
+        start = parse_address(addr)
+        code = decompile_function_safe(start, include_addresses=include_addresses)
         if code is None:
             return {"addr": addr, "code": None, "error": "Decompilation failed"}
-        return {"addr": addr, "code": code}
+        result: DecompileResult = {"addr": addr, "code": code}
+        try:
+            import ida_hexrays
+
+            if ida_hexrays.init_hexrays_plugin():
+                cfunc = ida_hexrays.decompile(start)
+                if cfunc:
+                    refs = _collect_decompile_refs(cfunc)
+                    if refs:
+                        result["refs"] = refs
+        except Exception:
+            pass
+        return result
     except Exception as e:
         return {"addr": addr, "code": None, "error": str(e)}
 
@@ -687,18 +797,7 @@ def disasm(
         offset = 0
 
     try:
-        try:
-            start = parse_address(addr)
-        except IDAError:
-            ea = idaapi.get_name_ea(idaapi.BADADDR, addr)
-            if ea == idaapi.BADADDR:
-                return {
-                    "addr": addr,
-                    "asm": None,
-                    "error": f"Function not found: {addr!r}",
-                    "cursor": {"done": True},
-                }
-            start = ea
+        start = parse_address(addr)
         func = idaapi.get_func(start)
 
         # Get segment info
@@ -737,7 +836,20 @@ def disasm(
             if len(lines) < max_instructions:
                 line = ida_lines.generate_disasm_line(ea, 0)
                 instruction = ida_lines.tag_remove(line) if line else ""
-                lines.append({"addr": f"{ea:x}", "instruction": instruction})
+                entry: dict = {
+                    "addr": f"{ea:x}",
+                    "instruction": compact_whitespace(instruction),
+                }
+                name = ida_name.get_ea_name(ea)
+                if name:
+                    entry["label"] = name
+                comments = _collect_line_comments(ea)
+                if comments:
+                    entry["comments"] = comments
+                refs = _collect_line_refs(ea)
+                if refs:
+                    entry["refs"] = refs
+                lines.append(entry)
                 seen += 1
                 return True
             more = True
@@ -823,28 +935,16 @@ def disasm(
 @tool_timeout(120.0)
 def func_profile(
     queries: Annotated[
-        list[FuncProfileQuery] | FuncProfileQuery | str,
+        list[FuncProfileQuery] | FuncProfileQuery,
         "Function profiling query (supports name/address filters + pagination)",
     ],
 ) -> list[FuncProfileResult]:
     """Profile functions with summary metrics and optional sampled details."""
-    queries = normalize_dict_list(
-        queries,
-        lambda s: {
-            "query": s,
-            "offset": 0,
-            "count": 50,
-            "sort_by": "addr",
-            "descending": False,
-            "include_lists": False,
-            "max_items": 25,
-            "include_prototype": False,
-        },
-    )
+    queries = normalize_dict_list(queries)
 
     results: list[dict] = []
     for query in queries:
-        q = str(query.get("query", "*") or "*").strip()
+        q = str(query.get("addr", "*") or "*").strip()
         filter_pattern = str(query.get("filter", "") or "")
         offset = _clamp_int(query.get("offset", 0), 0, 0, 2_000_000_000)
         count = _clamp_int(query.get("count", 50), 50, 0, 1000)
@@ -861,7 +961,7 @@ def func_profile(
             if err is not None or start_ea is None:
                 results.append(
                     {
-                        "query": q,
+                        "target": q,
                         "data": [],
                         "next_offset": None,
                         "error": err or "Failed to resolve function",
@@ -921,7 +1021,7 @@ def func_profile(
 
         results.append(
             {
-                "query": q,
+                "target": q,
                 "data": profiled,
                 "next_offset": page["next_offset"],
                 "error": None,
@@ -936,44 +1036,24 @@ def func_profile(
 @tool_timeout(120.0)
 def analyze_batch(
     queries: Annotated[
-        list[AnalyzeBatchQuery] | AnalyzeBatchQuery | str,
+        list[AnalyzeBatchQuery] | AnalyzeBatchQuery,
         "Comprehensive per-function analysis with selectable sections",
     ],
 ) -> list[AnalyzeBatchResult]:
     """Run comprehensive analysis over one or more target functions."""
-    queries = normalize_dict_list(
-        queries,
-        lambda s: {
-            "query": s,
-            "include_decompile": True,
-            "include_disasm": False,
-            "include_xrefs": True,
-            "include_callers": True,
-            "include_callees": True,
-            "include_strings": True,
-            "include_constants": True,
-            "include_basic_blocks": True,
-            "include_proto": True,
-            "max_disasm_insns": 300,
-            "max_callers": 100,
-            "max_callees": 100,
-            "max_strings": 100,
-            "max_constants": 200,
-            "max_blocks": 500,
-        },
-    )
+    queries = normalize_dict_list(queries)
 
     results: list[dict] = []
     for query in queries:
-        q = str(query.get("query", "") or query.get("addr", "") or "").strip()
+        q = str(query.get("addr", "") or "").strip()
         if not q:
             results.append(
                 {
-                    "query": q,
+                    "target": q,
                     "addr": None,
                     "name": None,
                     "analysis": None,
-                    "error": "Function query is required",
+                    "error": "addr is required",
                 }
             )
             continue
@@ -982,7 +1062,7 @@ def analyze_batch(
         if err is not None or start_ea is None:
             results.append(
                 {
-                    "query": q,
+                    "target": q,
                     "addr": None,
                     "name": None,
                     "analysis": None,
@@ -1115,7 +1195,7 @@ def analyze_batch(
 
             results.append(
                 {
-                    "query": q,
+                    "target": q,
                     "addr": hex(fn.start_ea),
                     "name": fn_name,
                     "analysis": analysis,
@@ -1125,7 +1205,7 @@ def analyze_batch(
         except Exception as e:
             results.append(
                 {
-                    "query": q,
+                    "target": q,
                     "addr": hex(start_ea),
                     "name": None,
                     "analysis": None,
@@ -1144,10 +1224,10 @@ def analyze_batch(
 @tool
 @idasync
 def xrefs_to(
-    addrs: Annotated[list[str] | str, "Addresses to find cross-references to"],
+    addrs: Annotated[list[str] | str, "Addresses or function names to find cross-references to (e.g. '0x11a9', 'check_pw', 'main')"],
     limit: Annotated[int, "Max xrefs per address (default: 100, max: 1000)"] = 100,
 ) -> list[XrefsToResult]:
-    """Return xrefs to address(es), capped per target with truncation flag."""
+    """Return xrefs to address(es) or named symbols, capped per target with truncation flag."""
     addrs = normalize_list_input(addrs)
 
     if limit <= 0 or limit > 1000:
@@ -1181,29 +1261,16 @@ def xrefs_to(
 @idasync
 def xref_query(
     queries: Annotated[
-        list[XrefQuery] | XrefQuery | str,
+        list[XrefQuery] | XrefQuery,
         "Generic xref query with direction/type filters and pagination",
     ],
 ) -> list[XrefQueryResult]:
     """Query xrefs with direction/type filters and pagination."""
-    queries = normalize_dict_list(
-        queries,
-        lambda s: {
-            "query": s,
-            "direction": "both",
-            "xref_type": "any",
-            "offset": 0,
-            "count": 200,
-            "include_fn": True,
-            "dedup": True,
-            "sort_by": "addr",
-            "descending": False,
-        },
-    )
+    queries = normalize_dict_list(queries)
 
     results: list[dict] = []
     for query in queries:
-        q = str(query.get("query", "")).strip()
+        q = str(query.get("addr", "")).strip()
         direction = str(query.get("direction", "both") or "both").lower()
         xref_type = str(query.get("xref_type", "any") or "any").lower()
         offset = _clamp_int(query.get("offset", 0), 0, 0, 2_000_000_000)
@@ -1220,7 +1287,7 @@ def xref_query(
 
         try:
             if not q:
-                raise ValueError("query is required")
+                raise ValueError("addr is required")
             try:
                 target = parse_address(q)
             except Exception:
@@ -1283,7 +1350,7 @@ def xref_query(
             page = paginate(rows, offset, count)
             results.append(
                 {
-                    "query": q,
+                    "target": q,
                     "resolved_addr": hex(target),
                     "direction": direction,
                     "xref_type": xref_type,
@@ -1296,7 +1363,7 @@ def xref_query(
         except Exception as e:
             results.append(
                 {
-                    "query": q,
+                    "target": q,
                     "resolved_addr": None,
                     "direction": direction,
                     "xref_type": xref_type,
@@ -1407,7 +1474,7 @@ def xrefs_to_field(
 @tool
 @idasync
 def callees(
-    addrs: Annotated[list[str] | str, "Function addresses to get callees for"],
+    addrs: Annotated[list[str] | str, "Function addresses or names to get callees for (e.g. '0x123e', 'main')"],
     limit: Annotated[int, "Max callees per function (default: 200, max: 500)"] = 200,
 ) -> list[CalleesResult]:
     """Return unique callees per function, capped by limit."""
@@ -1577,7 +1644,7 @@ def find_bytes(
 @tool
 @idasync
 def basic_blocks(
-    addrs: Annotated[list[str] | str, "Function addresses to get basic blocks for"],
+    addrs: Annotated[list[str] | str, "Function addresses or names to get basic blocks for (e.g. '0x123e', 'main')"],
     max_blocks: Annotated[
         int, "Max basic blocks per function (default: 1000, max: 10000)"
     ] = 1000,
@@ -2037,23 +2104,12 @@ def _scan_insn_ranges(
 @idasync
 def insn_query(
     queries: Annotated[
-        list[InsnPattern] | InsnPattern | str,
+        list[InsnPattern] | InsnPattern,
         "Instruction query with mnemonic/operand filters and scoped scan",
     ],
 ) -> list[InsnQueryResult]:
     """Query instructions with mnemonic/operand filters and scoped scans."""
-    queries = normalize_dict_list(
-        queries,
-        lambda s: {
-            "mnem": s,
-            "offset": 0,
-            "count": 100,
-            "max_scan_insns": 200000,
-            "allow_broad": False,
-            "include_fn": False,
-            "include_disasm": False,
-        },
-    )
+    queries = normalize_dict_list(queries)
 
     results: list[dict] = []
     for pattern in queries:
@@ -2114,7 +2170,7 @@ def insn_query(
                 row = {"addr": addr_s}
                 if include_disasm:
                     line = ida_lines.generate_disasm_line(ea, 0)
-                    row["disasm"] = ida_lines.tag_remove(line) if line else ""
+                    row["disasm"] = compact_whitespace(ida_lines.tag_remove(line)) if line else ""
                 if include_fn:
                     row["fn"] = get_function(ea, raise_error=False)
                 rows.append(row)
@@ -2166,7 +2222,7 @@ def insn_query(
 @tool
 @idasync
 def export_funcs(
-    addrs: Annotated[list[str] | str, "Function addresses to export"],
+    addrs: Annotated[list[str] | str, "Function addresses or names to export (e.g. '0x123e', 'main')"],
     format: Annotated[
         str, "Export format: json (default), c_header, or prototypes"
     ] = "json",
